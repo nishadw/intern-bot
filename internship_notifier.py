@@ -1,451 +1,336 @@
-import requests
-from bs4 import BeautifulSoup
-import schedule
-import time
 import os
-import sys
-from datetime import datetime
-import sendgrid
-from sendgrid.helpers.mail import Mail
-import certifi
+import json
+import smtplib
+import ssl
+import re
+from threading import Thread
+from time import perf_counter, time, localtime, strftime
+from email.mime.text import MIMEText
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.safari.options import Options as SafariOptions
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-import json
 
 # --- Configuration ---
-SCHEDULED_TIME = "18:00"  # 6 PM in 24-hour format
 
-# Updated intern-list.com sources with category descriptions
-INTERN_LIST_SOURCES = {
-    "All Internships": "https://www.intern-list.com",
-    "Engineering Internships": "https://www.intern-list.com/?k=eng",
-    "Data/Analytics Internships": "https://www.intern-list.com/?k=da", 
-    "AI/ML Internships": "https://www.intern-list.com/?k=aiml",
-    "Computer Science/Tech Internships": "https://www.intern-list.com/?k=cst"
+# Scraping
+HEIGHT = 32
+MAX_ITERATIONS = 75  # Failsafe if stop_rowid = []
+MAX_SEEN_ITEMS = 500 # Max items to store per link in seen_items.json
+WHITELIST_SIZES = ('1001-5000', '5001-10000', '10000+')
+
+# Formatting
+GAP = 2
+DELIM = " " * GAP + "|" + " " * GAP
+RECIPIENT_SPACING = {
+    "akshat.wajge@gmail.com": {"title": 60, "company": 25, "date": 10, "location": 20, "tags": 40},
+    "nishad.wajge@gmail.com": {"title": 85, "company": 35, "date": 10, "location": 20, "tags": 55}
 }
 
-# IMPORTANT: Replace with your actual SendGrid API key and email
-SENDGRID_API_KEY = "YOUR_SENDGRID_API_KEY_HERE"
-FROM_EMAIL = "your-email@example.com"
-TO_EMAIL = "your-email@example.com"
+# Email
+PORT = 465
+SMTP_SERVER = "smtp.gmail.com"
+USERNAME = os.environ.get('USER_EMAIL')
+PASSWORD = os.environ.get('USER_PASSWORD')
+RECIPIENTS = os.environ.get('RECIPIENTS', "").split(",")
 
-def setup_selenium_driver():
-    """Set up Safari driver with appropriate options for scraping intern-list.com"""
+# Selenium Options
+options = Options()
+options.add_argument("--headless=new")
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
+
+# --- Global State ---
+# This is modified by threads
+internships = {}  # {link: {"category": name, "links": [...]}}
+start_time = perf_counter()
+
+# --- Helper Functions ---
+
+def load_json(filename, default_value):
+    """Safely loads a JSON file, returning a default value on failure."""
     try:
-        driver = webdriver.Safari()
-        driver.set_window_size(1920, 1080)
-        return driver
-    except Exception as e:
-        print(f"Error setting up Safari driver: {e}")
-        print("Make sure you have:")
-        print("1. Safari > Preferences > Advanced > Show Develop menu in menu bar (checked)")
-        print("2. Develop > Allow Remote Automation (checked)")
-        return None
+        with open(filename, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default_value
 
-def scrape_intern_list_with_selenium(url, source_name, is_test=False, max_entries=10):
-    """
-    Scrape intern-list.com using Selenium to handle the integrated Airtable content
-    """
-    driver = setup_selenium_driver()
-    if not driver:
-        return []
+def get_innertext(driver, row, category, div_class="truncate", multiple=False):
+    """Extracts innerText from a cell based on the category (column header)."""
+    col_index = find_columnindex(driver, category)
+    selector = f'div[data-columnindex="{col_index}"] div.{div_class}'
+    
+    matches = [
+        match.get_attribute("innerText")
+        for match in row.find_element(By.CSS_SELECTOR, f'div[data-columnindex="{col_index}"]')
+                    .find_elements(By.CSS_SELECTOR, f"div.{div_class}")
+    ]
+
+    return matches if multiple else (matches[0] if matches else None)
+
+def find_columnindex(driver, category):
+    """Finds the dynamic column index for a given category name."""
+    header = driver.find_element(By.XPATH, f'//div[text()="{category}"]')
+    # Traverse up to the parent container that has the data-columnindex
+    return header.find_element(By.XPATH, "../../../../../..").get_attribute("data-columnindex")
+
+def append_data(driver, row):
+    """Builds a dictionary of internship data from a single row element."""
+    row_id = row.get_attribute("data-rowid")
+    
+    # Title is in the left pane, not the main row context
+    title_row = driver.find_element(By.CSS_SELECTOR, f'div[data-rowid="{row_id}"]')
+    title = get_innertext(driver, title_row, "Position Title")
+    
+    company = get_innertext(driver, row, "Company")
+    date = get_innertext(driver, row, "Date")
+    location = get_innertext(driver, row, "Location")
+    tags = get_innertext(driver, row, "Company Industry", "flex-auto.truncate-pre", True)
+    
+    # Find the parent 'a' tag to get the href
+    apply_link_element = row.find_element(By.CSS_SELECTOR, "span.truncate.noevents")
+    apply_link = apply_link_element.find_element(By.XPATH, "..").get_attribute("href")
+
+    if "Multi Location" in location:
+        location = "Multi Location"
+    if not tags:
+        tags = ["None"]
+
+    return {"title": title, "company": company, "date": date, "location": location, "tags": tags, "apply_link": apply_link}
+
+def add_internships(link, seen_links_set, attempts=1):
+    """Scrapes a single internship link. Designed to be run in a thread."""
+    
+    # 'seen_links_set' is now passed in as an argument
+
+    driver = webdriver.Chrome(options=options)
+    driver.set_window_size(1920, 1080)  # Necessary for some elements to render
+    driver.set_page_load_timeout(10)
+    wait = WebDriverWait(driver, 10)
 
     try:
-        print(f"Loading {source_name}...")
-        driver.get(url)
+        driver.get(link)
+        wait.until(EC.presence_of_element_located((By.ID, "airtable-box")))
+        list_name = driver.find_element(By.CSS_SELECTOR, "h2.active").get_attribute("innerText")
         
-        # Wait for the page to load completely
-        wait = WebDriverWait(driver, 20)
-        
-        # Wait for the Airtable embed or main content to load
-        try:
-            # Try multiple selectors that might indicate the table has loaded
-            selectors_to_wait_for = [
-                "iframe[src*='airtable']",  # Airtable iframe
-                ".airtable-embed",          # Airtable embed wrapper
-                "table",                    # Any table
-                "[data-record-id]",         # Airtable record elements
-                ".record",                  # Record class
-                "tbody tr",                 # Table rows
-                "[role='row']"              # ARIA row elements
-            ]
-            
-            element_found = False
-            for selector in selectors_to_wait_for:
-                try:
-                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-                    print(f"✅ Found content using selector: {selector}")
-                    element_found = True
-                    break
-                except TimeoutException:
-                    continue
-            
-            if not element_found:
-                print("⚠️ Specific content selectors not found, proceeding anyway...")
-            
-            # Additional wait for dynamic content
-            time.sleep(5)
-            
-        except Exception as e:
-            print(f"Warning loading {source_name}: {e}")
-            time.sleep(3)  # Still try to scrape
+        airtable_url = driver.find_element(By.ID, "airtable-box").get_attribute("src")
+        driver.get(airtable_url)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.dataRow.rightPane")))
 
-        # Scroll to ensure all content is loaded
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
-        driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(1)
-
-        # Try to find Airtable iframe first
-        internships = []
-        iframe_found = False
-        
-        try:
-            iframes = driver.find_elements(By.CSS_SELECTOR, "iframe")
-            for iframe in iframes:
-                src = iframe.get_attribute('src')
-                if src and 'airtable' in src.lower():
-                    print(f"Found Airtable iframe: {src}")
-                    driver.switch_to.frame(iframe)
-                    iframe_found = True
-                    
-                    # Wait for Airtable content inside iframe
-                    try:
-                        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "tr, [role='row'], .record")))
-                        time.sleep(3)
-                    except TimeoutException:
-                        print("Timeout waiting for Airtable content in iframe")
-                    
-                    internships = extract_internships_from_airtable(driver, source_name, is_test, max_entries)
-                    driver.switch_to.default_content()
-                    break
-        except Exception as e:
-            print(f"Error checking for iframe: {e}")
-
-        # If no iframe found or no data from iframe, try direct page scraping
-        if not iframe_found or not internships:
-            print("Trying direct page scraping...")
-            internships = extract_internships_from_page(driver, source_name, is_test, max_entries)
-
-        print(f"Extracted {len(internships)} internships from {source_name}")
-        return internships
-
-    except Exception as e:
-        print(f"Error scraping {source_name}: {e}")
-        return []
-    finally:
-        driver.quit()
-
-def extract_internships_from_airtable(driver, source_name, is_test=False, max_entries=10):
-    """Extract internships from Airtable content"""
-    internships = []
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    
-    # Try multiple selectors for Airtable rows
-    row_selectors = [
-        "tr[data-row-id]",
-        "tbody tr:not(:first-child)",
-        "[role='row']:not([role='columnheader'])",
-        ".record",
-        "tr:has(td)",
-        "tr:not(:first-child)"
-    ]
-    
-    rows = []
-    for selector in row_selectors:
-        try:
-            rows = driver.find_elements(By.CSS_SELECTOR, selector)
-            if rows:
-                print(f"Found {len(rows)} rows using selector: {selector}")
-                break
-        except:
-            continue
-    
-    if not rows:
-        print("No rows found in Airtable")
-        return []
-    
-    rows_to_process = rows[:max_entries] if is_test else rows
-    
-    for i, row in enumerate(rows_to_process):
-        try:
-            cells = row.find_elements(By.CSS_SELECTOR, "td, [role='cell'], [role='gridcell']")
-            if len(cells) < 3:
-                continue
-            
-            # Extract data (adjust indices based on actual table structure)
-            company = cells[0].text.strip() if len(cells) > 0 else ""
-            position_title = cells[1].text.strip() if len(cells) > 1 else ""
-            date_posted = cells[2].text.strip() if len(cells) > 2 else ""
-            
-            # Look for apply link
-            apply_link = ""
-            link_elements = row.find_elements(By.CSS_SELECTOR, "a[href]")
-            if link_elements:
-                apply_link = link_elements[0].get_attribute('href')
-            
-            if not company or not position_title:
-                continue
-            
-            # Check date matching
-            date_match = is_test or (date_posted and today_str in date_posted)
-            
-            if date_match:
-                internships.append({
-                    "company": company,
-                    "role": position_title,
-                    "link": apply_link or f"https://www.intern-list.com",
-                    "source": source_name,
-                    "date_posted": date_posted
-                })
-                
-                if is_test and len(internships) >= max_entries:
-                    break
-            elif not is_test:
-                break  # Stop if entries are older
-                
-        except Exception as e:
-            if is_test:
-                print(f"Error processing row {i}: {e}")
-            continue
-    
-    return internships
-
-def extract_internships_from_page(driver, source_name, is_test=False, max_entries=10):
-    """Extract internships directly from the page (fallback method)"""
-    internships = []
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    
-    # Try various selectors for internship listings
-    listing_selectors = [
-        ".internship-item",
-        ".listing",
-        ".job-listing",
-        "tr:has(td)",
-        ".record",
-        "[data-record-id]",
-        "div[class*='internship']",
-        "div[class*='job']"
-    ]
-    
-    listings = []
-    for selector in listing_selectors:
-        try:
-            listings = driver.find_elements(By.CSS_SELECTOR, selector)
-            if listings:
-                print(f"Found {len(listings)} listings using selector: {selector}")
-                break
-        except:
-            continue
-    
-    if not listings:
-        print("No listings found on page")
-        return []
-    
-    listings_to_process = listings[:max_entries] if is_test else listings
-    
-    for i, listing in enumerate(listings_to_process):
-        try:
-            # Try to extract company, role, and date
-            company_elements = listing.find_elements(By.CSS_SELECTOR, 
-                "td:first-child, .company, [class*='company'], strong, b")
-            role_elements = listing.find_elements(By.CSS_SELECTOR,
-                "td:nth-child(2), .role, .position, .title, [class*='role'], [class*='position']")
-            date_elements = listing.find_elements(By.CSS_SELECTOR,
-                "td:last-child, .date, [class*='date'], time")
-            link_elements = listing.find_elements(By.CSS_SELECTOR, "a[href]")
-            
-            company = company_elements[0].text.strip() if company_elements else ""
-            role = role_elements[0].text.strip() if role_elements else ""
-            date_posted = date_elements[0].text.strip() if date_elements else ""
-            apply_link = link_elements[0].get_attribute('href') if link_elements else ""
-            
-            if not company or not role:
-                # Try alternative extraction
-                all_text = listing.text.strip().split('\n')
-                if len(all_text) >= 2:
-                    company = all_text[0]
-                    role = all_text[1]
-                    date_posted = all_text[-1] if len(all_text) > 2 else ""
-            
-            if company and role:
-                date_match = is_test or (date_posted and today_str in date_posted)
-                
-                if date_match:
-                    internships.append({
-                        "company": company,
-                        "role": role,
-                        "link": apply_link or f"https://www.intern-list.com",
-                        "source": source_name,
-                        "date_posted": date_posted
-                    })
-                    
-                    if is_test and len(internships) >= max_entries:
-                        break
-                elif not is_test:
-                    break
-                    
-        except Exception as e:
-            if is_test:
-                print(f"Error processing listing {i}: {e}")
-            continue
-    
-    return internships
-
-def scrape_todays_internships_from_url(url, source_name, is_test=False):
-    """
-    Main scraping function for intern-list.com
-    """
-    return scrape_intern_list_with_selenium(url, source_name, is_test)
-
-def send_email(todays_internships):
-    """Send email with internship digest"""
-    if not SENDGRID_API_KEY or SENDGRID_API_KEY == "YOUR_SENDGRID_API_KEY_HERE":
-        print("⚠️  SendGrid API key not configured. Email not sent.")
-        print("Please update SENDGRID_API_KEY with your actual API key.")
+    except Exception:
+        # Retry the entire function on navigation failure
+        driver.close()
+        add_internships(link, seen_links_set, attempts + 1) # Pass the set in the retry
         return
-    
-    date_str = datetime.now().strftime('%b %d, %Y')
-    
-    if todays_internships:
-        subject = f"✅ Daily Internship Digest - {len(todays_internships)} New Roles Found!"
-        html_content = f"""
-        <html><head><style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-            h2 {{ color: #333; }}
-            table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
-            th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
-            th {{ background-color: #f2f2f2; font-weight: bold; }}
-            tr:nth-child(even) {{ background-color: #f9f9f9; }}
-            a {{ color: #0066cc; text-decoration: none; }}
-            a:hover {{ text-decoration: underline; }}
-        </style></head><body>
-            <h2>🎯 Internships Posted on {date_str}</h2>
-            <p>Found {len(todays_internships)} new internship opportunities from intern-list.com!</p>
-            <table>
-                <tr><th>Company</th><th>Role</th><th>Source</th><th>Date Posted</th><th>Apply</th></tr>
-        """
-        for intern in todays_internships:
-            html_content += f"""
-                <tr>
-                    <td>{intern['company']}</td>
-                    <td>{intern['role']}</td>
-                    <td>{intern['source']}</td>
-                    <td>{intern.get('date_posted', 'N/A')}</td>
-                    <td><a href='{intern['link']}' target='_blank'>Apply Now</a></td>
-                </tr>
-            """
-        html_content += """
-            </table>
-            <p style='margin-top: 20px; color: #666; font-size: 14px;'>
-                Good luck with your applications! 🚀<br>
-                <em>Data sourced from intern-list.com</em>
-            </p>
-        </body></html>
-        """
-    else:
-        subject = f"👍 Internship Digest: No New Postings Found for {date_str}"
-        html_content = f"""
-        <html><body style='font-family: Arial, sans-serif; margin: 20px;'>
-            <h2>📊 Daily Internship Check Complete</h2>
-            <p>Your script ran successfully and checked intern-list.com sources for internships posted today ({date_str}).</p>
-            <p><strong>Result:</strong> No new internships found with today's date.</p>
-            <p style='color: #666; font-size: 14px;'>Keep checking back - new opportunities are posted regularly!</p>
-        </body></html>
-    """
-    
-    message = Mail(
-        from_email=FROM_EMAIL,
-        to_emails=[TO_EMAIL],
-        subject=subject,
-        html_content=html_content
-    )
-    
-    try:
-        os.environ['SSL_CERT_FILE'] = certifi.where()
-        sg = sendgrid.SendGridAPIClient(SENDGRID_API_KEY)
-        response = sg.send(message)
-        print(f"📧 Email sent successfully! (Status: {response.status_code})")
-    except Exception as e:
-        print(f"❌ Error sending email: {e}")
 
-def run_job(is_test=False):
-    """Main job function"""
-    job_type = "Test Run" if is_test else "Daily Job"
-    print(f"\n🚀 Starting {job_type} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 50)
+    scrollable = driver.find_element(By.CSS_SELECTOR, "div.antiscroll-inner")
     
-    all_todays_internships = []
+    local_dict = {}
+    finished = False
+    row_count = 0
     
-    for source_title, url in INTERN_LIST_SOURCES.items():
-        print(f"\n📊 Scraping '{source_title}'...")
-        internships_from_source = scrape_todays_internships_from_url(url, source_title, is_test)
+    while not finished:
+        elements = driver.find_elements(By.CSS_SELECTOR, "div.dataRow.rightPane.rowExpansionEnabled.rowSelectionEnabled")
         
-        if internships_from_source:
-            print(f"✅ Found {len(internships_from_source)} internships")
-            # Remove duplicates based on company + role combination
-            for internship in internships_from_source:
-                duplicate = False
-                for existing in all_todays_internships:
-                    if (existing['company'].lower() == internship['company'].lower() and 
-                        existing['role'].lower() == internship['role'].lower()):
-                        duplicate = True
-                        break
-                if not duplicate:
-                    all_todays_internships.append(internship)
+        if row_count < len(elements) - 1:
+            row = elements[row_count]
         else:
-            print("❌ No internships found")
-    
-    print(f"\n📈 Total unique internships found: {len(all_todays_internships)}")
-    print("📧 Sending email digest...")
-    send_email(all_todays_internships)
-    print(f"✅ {job_type} completed!\n")
+            # Load new row at the bottom and scroll
+            row = elements[-1]
+            driver.execute_script(f"arguments[0].scrollTop += {HEIGHT};", scrollable)
 
-# --- Main Execution ---
-if __name__ == "__main__":
-    # Check if required packages are installed
-    try:
-        from selenium import webdriver
-        print("✅ Selenium is available")
+        row_data = append_data(driver, row)
+
+        # Stop if the link is IN THE SEEN DATABASE, or we hit the failsafe
+        if (row_data["apply_link"] in seen_links_set) or (len(local_dict) == MAX_ITERATIONS):
+            finished = True
+        elif get_innertext(driver, row, "Company Size", "flex-auto.truncate-pre") in WHITELIST_SIZES:
+            local_dict[row.get_attribute("data-rowid")] = row_data
         
-        # Test Safari driver
-        try:
-            test_driver = webdriver.Safari()
-            test_driver.quit()
-            print("✅ Safari WebDriver is properly configured")
-        except Exception as e:
-            print(f"❌ Safari WebDriver configuration issue: {e}")
-            print("Please ensure:")
-            print("1. Safari > Preferences > Advanced > Show Develop menu in menu bar")
-            print("2. Develop > Allow Remote Automation")
-            
-    except ImportError:
-        print("❌ Selenium not installed. Install with: pip install selenium")
-        sys.exit(1)
+        row_count += 1
+
+    # Update global state (mutations are on unique keys, so thread-safe-ish)
+    scraped_links = list(local_dict.values())
+    internships[link] = {"category": list_name, "links": scraped_links}
+
+    print(f'Thread "{link}" processed {len(scraped_links)} items in {(perf_counter() - start_time):.3f}s ({attempts} attempt(s))')
+    driver.close()
+
+# --- Formatting and Email ---
+
+def truncate(string, num, part=True):
+    """Pads or truncates a string to a fixed length."""
+    return string.ljust(num)[:num] + (DELIM if part else " " * GAP)
+
+def format_internship_html(data, custom_space, on_watchlist, in_cali):
+    """Formats a single internship entry into an HTML line."""
+    link_sub = truncate(data["title"], custom_space["title"], False).strip()
     
-    if len(sys.argv) > 1 and sys.argv[1].lower() == 'test':
-        print("🧪 Running in TEST mode - will get recent internships regardless of date")
-        run_job(is_test=True)
+    line = (f'<a href="{data["apply_link"]}" target="_blank">{link_sub}</a>')
+    line += ' ' * (custom_space["title"] - len(link_sub)) + DELIM
+    line += truncate(data["company"], custom_space["company"])
+    line += truncate(data["date"], custom_space["date"])
+    line += truncate(data["location"], custom_space["location"])
+    line += truncate(", ".join(str(tag) for tag in data["tags"]), custom_space["tags"], False)
+
+    # Apply highlighting
+    if on_watchlist:
+        line = f'<span style="background-color: #fff8b3;">{line}</span>'
+    elif in_cali:
+        line = f'<span style="background-color: #c8f7c5;">{line}</span>'
+
+    return line + "\n"
+
+def make_message_html(recipient, internship_links, watchlist):
+    """Builds the full HTML email body for a specific recipient."""
+    message_text = ""
+    global_watchlist_entries = []
+    processed_watchlist_links = set() # To track items already in the global list
+
+    # --- 1. First Pass: Collect all watchlist items ---
+    all_links_in_order = internship_links + [k for k in internships if k not in internship_links]
+    
+    for link in all_links_in_order:
+        if link not in internships:
+            continue
+        
+        link_data = internships[link]
+        for data in link_data["links"]:
+            on_watchlist = data["company"].strip() in watchlist
+            if on_watchlist:
+                # Format it (in_cali doesn't matter for watchlist highlighting)
+                line_html = format_internship_html(data, RECIPIENT_SPACING[recipient], on_watchlist=True, in_cali=False)
+                global_watchlist_entries.append(line_html)
+                processed_watchlist_links.add(data["apply_link"]) # Mark as processed
+
+    # --- 2. Build the Watchlist section at the top ---
+    if global_watchlist_entries:
+        message_text += f"===== ⭐ Watchlist ({len(global_watchlist_entries)}) =====\n\n"
+        message_text += "".join(global_watchlist_entries)
+
+    # --- 3. Second Pass: Process all other items ---
+    first_regular_list = True
+    for link in all_links_in_order:
+        if link not in internships:
+            continue
+            
+        link_data = internships[link]
+        
+        instate_entries = []
+        regular_entries = []
+
+        for data in link_data["links"]:
+            # *** CHECK IF ALREADY PROCESSED ***
+            if data["apply_link"] in processed_watchlist_links:
+                continue # Skip, it's in the global list
+
+            # Item is not on watchlist, check if it's in CA
+            in_cali = any(match in data["location"] for match in ["CA", "California"])
+            
+            # Pass on_watchlist=False since it's not
+            line_html = format_internship_html(data, RECIPIENT_SPACING[recipient], on_watchlist=False, in_cali=in_cali)
+            
+            if in_cali:
+                instate_entries.append(line_html)
+            else:
+                regular_entries.append(line_html)
+
+        # Combine groups for this link
+        text_subsection = "".join(instate_entries) + "".join(regular_entries)
+        
+        if text_subsection: # Only add header if there are non-watchlist items
+            if global_watchlist_entries and first_regular_list:
+                 message_text += "\n\n" + ("-" * 40) + "\n" # Add a big separator
+                 first_regular_list = False # Only do this once
+
+            category_name = re.sub(r"[^a-zA-Z0-9 ]+", "", link_data["category"]).strip()
+            # Get count of *only* the new items for this list
+            new_item_count = len(instate_entries) + len(regular_entries) 
+            
+            header = f'\n===== From: <a href="{link}" target="_blank">{category_name}</a> ({new_item_count}) =====\n\n'
+            message_text += header + text_subsection
+
+    # --- 4. Create and return the email message object ---
+    total_internships = sum(len(data["links"]) for data in internships.values())
+    email_html = f'<pre style="font-family: monospace;">{message_text}</pre>'
+    message = MIMEText(email_html, 'html')
+
+    message['Subject'] = f"Intern Bot 🤖 : {total_internships} internships found on {strftime('%m/%d/%Y', localtime(time()))}"
+    message["From"] = USERNAME
+    message["To"] = recipient
+    
+    return message.as_string()
+
+
+def send_emails(internship_links, watchlist):
+    """Logs into SMTP server and sends all emails."""
+    print("Connecting to email server...")
+    context = ssl.create_default_context()
+    
+    with smtplib.SMTP_SSL(SMTP_SERVER, PORT, context=context) as server:
+        server.login(USERNAME, PASSWORD)
+        for recipient in [r.strip() for r in RECIPIENTS if r.strip]:
+            # Pass watchlist to the message builder
+            message_string = make_message_html(recipient, internship_links, watchlist)
+            server.sendmail(USERNAME, recipient, message_string)
+            print(f"Message sent to {recipient}")
+            
+# --- Main Execution ---
+
+def main():
+    """Main script logic."""
+    # 1. Load configuration files
+    internship_links = load_json("links.json", [])
+    all_seen_data = load_json("seen_items.json", {}) 
+    watchlist = load_json("watchlist.json", []) # Watchlist is loaded here
+
+    if not internship_links:
+        print("No links found in 'links.json'. Exiting.")
+        return
+        
+    if not USERNAME or not PASSWORD or not RECIPIENTS:
+        print("Email credentials (USER_EMAIL, USER_PASSWORD, RECIPIENTS) not set in environment. Exiting.")
+        return
+
+    # 2. Start scraping threads
+    threads = []
+    for link in internship_links:
+        seen_links_for_thread = set(all_seen_data.get(link, []))
+        t = Thread(target=add_internships, args=(link, seen_links_for_thread))
+        threads.append(t)
+        t.start()
+
+    # 3. Wait for all threads to complete
+    [t.join() for t in threads]
+    print("Scraping complete.")
+
+    # 4. Update and save 'seen_items.json'
+    new_all_seen_data = {}
+    for link_url in internship_links:
+        new_links = [item["apply_link"] for item in internships.get(link_url, {}).get("links", [])]
+        old_links_set = set(all_seen_data.get(link_url, []))
+        old_links_set.update(new_links)
+        
+        new_list = list(old_links_set)
+        if len(new_list) > MAX_SEEN_ITEMS:
+            new_list = new_list[-MAX_SEEN_ITEMS:] 
+            
+        new_all_seen_data[link_url] = new_list
+
+    with open("seen_items.json", "w") as f:
+        json.dump(new_all_seen_data, f, indent=4)
+        print("Wrote 'seen_items.json'.")
+
+    # 5. Send emails
+    if any(data["links"] for data in internships.values()):
+        # Pass watchlist to the send_emails function
+        send_emails(internship_links, watchlist)
     else:
-        print(f"⏰ Starting scheduled internship notifier for intern-list.com")
-        print(f"📅 Daily emails will be sent at {SCHEDULED_TIME} (6 PM)")
-        print("🛑 Press Ctrl+C to stop")
-        print(f"🔧 Make sure to update your SendGrid API key and email addresses!")
-        
-        schedule.every().day.at(SCHEDULED_TIME).do(run_job)
-        
-        # Run once immediately to test
-        print("\n🏃 Running initial test...")
-        run_job(is_test=True)
-        
-        while True:
-            try:
-                schedule.run_pending()
-                time.sleep(60)  # Check every minute
-            except KeyboardInterrupt:
-                print("\n👋 Script stopped by user")
-                break
+        print("No new internships found. No emails sent.")
+
+    print(f"Script finished in {(perf_counter() - start_time):.3f} seconds.")
+
+if __name__ == "__main__":
+    main()
