@@ -98,6 +98,7 @@ def append_data(driver, row):
     if not tags:
         tags = ["None"]
 
+    # --- This is the completion of the cut-off function ---
     return {"title": title, "company": company, "date": date, "location": location, "tags": tags, "apply_link": apply_link}
 
 def add_internships(link, seen_links_set, attempts=1):
@@ -265,8 +266,8 @@ def make_message_html(recipient, internship_links, watchlist):
 
 
 def send_emails(internship_links, watchlist):
-    """Logs into SMTP server and sends all emails."""
-    print("Connecting to email server...")
+    """Logs into SMTP server and sends the full, formatted internship report."""
+    print("Connecting to email server to send full report...")
     context = ssl.create_default_context()
     
     with smtplib.SMTP_SSL(SMTP_SERVER, PORT, context=context) as server:
@@ -275,7 +276,27 @@ def send_emails(internship_links, watchlist):
             # Pass watchlist to the message builder
             message_string = make_message_html(recipient, internship_links, watchlist)
             server.sendmail(USERNAME, recipient, message_string)
-            print(f"Message sent to {recipient}")
+            print(f"Full report sent to {recipient}")
+
+# --- NEW FUNCTION ---
+def send_no_internships_email():
+    """Logs into SMTP server and sends a simple 'no new items' email."""
+    print("Connecting to email server to send 'no internships' email...")
+    context = ssl.create_default_context()
+    
+    subject = f"Intern Bot 🤖 : 0 internships found on {strftime('%m/%d/%Y', localtime(time()))}"
+    body = "No Internships Posted Today"
+
+    with smtplib.SMTP_SSL(SMTP_SERVER, PORT, context=context) as server:
+        server.login(USERNAME, PASSWORD)
+        for recipient in [r.strip() for r in RECIPIENTS if r.strip()]:
+            message = MIMEText(body, 'html') # Using 'html' for consistency
+            message['Subject'] = subject
+            message["From"] = USERNAME
+            message["To"] = recipient
+            
+            server.sendmail(USERNAME, recipient, message.as_string())
+            print(f"Sent 'no internships' email to {recipient}")
             
 # --- Main Execution ---
 
@@ -323,12 +344,16 @@ def main():
         json.dump(new_all_seen_data, f, indent=4)
         print("Wrote 'seen_items.json'.")
 
-    # 5. Send emails
-    if any(data["links"] for data in internships.values()):
+    # 5. --- MODIFIED EMAIL LOGIC ---
+    # Check if any list in the internships dict has new links
+    if any(data.get("links") for data in internships.values()):
         # Pass watchlist to the send_emails function
+        print("New internships found. Sending full report...")
         send_emails(internship_links, watchlist)
     else:
-        print("No new internships found. No emails sent.")
+        # No new internships were found in any list
+        print("No new internships found. Sending 'no new items' email.")
+        send_no_internships_email() # Call the new function
 
     print(f"Script finished in {(perf_counter() - start_time):.3f} seconds.")
 
