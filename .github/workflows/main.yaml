@@ -1,0 +1,42 @@
+name: daily-report
+
+on:
+  schedule:
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Run Intern Bot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+        with:
+          python-version: 3.x
+
+      - uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: 139
+          install-chromedriver: true
+          install-dependencies: true
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Intern Bot
+        env:
+          USER_EMAIL: ${{ secrets.USER_EMAIL }}
+          USER_PASSWORD:  ${{ secrets.USER_PASSWORD }}
+          RECIPIENTS: ${{ secrets.RECIPIENTS }}
+        run: python internship_notifier.py
+
+      - uses: stefanzweifel/git-auto-commit-action@v6
+        with:
+          commit_message: Automated commit from GitHub Actions
+          commit_user_name: GitHub Actions
+          commit_user_email: actions@github.com
+          commit_author: GitHub Actions <actions@github.com>
